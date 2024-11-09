@@ -1,0 +1,9 @@
+build/
+*.o
+*.out
+*.a
+*.dSYM/
+CMakeFiles/
+CMakeCache.txt
+.DS_Store
+.vscode/
