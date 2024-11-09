@@ -766,7 +766,7 @@ void GenerateRandomBytes(std::uint8_t* buffer, size_t length)
 #ifdef __APPLE__
     int result = SecRandomCopyBytes(kSecRandomDefault, length, buffer);
     if (result != 0) {
-        throw std::runtime_error("Error: SecRandomCopyBytes failed with error " << std::to_string(result));
+        throw std::runtime_error("Error: SecRandomCopyBytes failed with error " + std::to_string(result));
     }
 #elif defined(__linux__)
     int result = RAND_bytes(buffer, length) ? 0 : 1;
