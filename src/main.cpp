@@ -3,21 +3,41 @@
 #include <string>
 #include <vector>
 #include <sstream>
-#include <CommonCrypto/CommonCrypto.h>
-#include <Security/Security.h>
-#include <mach/mach_time.h>
 #include <random>
 #include <cstdint>
 #include <array>
 #include <optional>
 #include <functional>
 #include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <cstring>
 
-#if defined(__linux__)
-#include <linux/fs.h>
-#elif defined(__APPLE__)
-#include <sys/disk.h>
+#include <fcntl.h>
+#include <sys/ioctl.h>
+#include <unistd.h>
+
+#ifdef __APPLE__
+#include <CommonCrypto/CommonCrypto.h>
+#include <Security/Security.h>
+#elif defined(__linux__)
+#include <openssl/evp.h>
+#include <openssl/rand.h>
 #endif
+
+
+#ifdef __APPLE__
+#include <sys/disk.h>
+#elif defined(__linux__)
+#include <linux/fs.h>
+#endif
+
+#ifdef __APPLE__
+#include <mach/mach_time.h>
+#elif defined(__linux__)
+#include <ctime> 
+#endif
+
 
 const std::uint32_t kAES128KeySize = 128/8;
 const std::uint32_t kAESBlockSize = 128/8;
@@ -45,6 +65,7 @@ public:
     bool Encrypt(const TAESBlock& inBlock, TAESBlock& outBlock) const {
         size_t outLength = 0;
 
+#ifdef __APPLE__
         CCCryptorStatus status = CCCrypt(kCCEncrypt, kCCAlgorithmAES128, kCCOptionECBMode,
                                          m_key.data(), m_key.size(),
                                          nullptr, // No initialization vector for ECB
@@ -58,6 +79,32 @@ public:
 
             return false;
         }
+
+#elif defined(__linux__)
+        EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+        if (!ctx) return false;
+
+        if (1 != EVP_EncryptInit_ex(ctx, EVP_aes_128_ecb(), nullptr, m_key.data(), nullptr)) {
+            EVP_CIPHER_CTX_free(ctx);
+            return false;
+        }
+
+        if (1 != EVP_EncryptUpdate(ctx, outBlock.data(), (int*)&outLength, inBlock.data(), inBlock.size())) {
+            EVP_CIPHER_CTX_free(ctx);
+            return false;
+        }
+
+        if (1 != EVP_EncryptFinal_ex(ctx, outBlock.data() + outLength, (int*)&outLength)) {
+            EVP_CIPHER_CTX_free(ctx);
+            return false;
+        }
+
+        EVP_CIPHER_CTX_free(ctx);
+#else
+#error
+#endif
+
+
         if (outLength != outBlock.size()) {
             std::cerr << __FUNCTION__ << ": Unexpected output length " << outLength << std::endl;
             return false;
@@ -80,20 +127,28 @@ public:
     }
 
     bool Encrypt(const uint8_t* input, uint8_t* output, size_t length, std::uint64_t iv) const {
-        return Process(input, output, length, iv, kCCEncrypt);
+        return Process(input, output, length, iv, EOperation::Encrypt);
     }
 
     bool Decrypt(const uint8_t* input, uint8_t* output, size_t length, std::uint64_t iv) const {
-        return Process(input, output, length, iv, kCCDecrypt);
+        return Process(input, output, length, iv, EOperation::Decrypt);
     }
 
 private:
-    bool Process(const uint8_t* input, uint8_t* output, size_t length, std::uint64_t iv, CCOperation operation) const {
+
+    enum class EOperation {
+        Encrypt,
+        Decrypt
+    };
+
+    bool Process(const uint8_t* input, uint8_t* output, size_t length, std::uint64_t iv, EOperation operation) const {
         size_t outLength = 0;
         TAESBlock ivBlock = {};
         std::copy(reinterpret_cast<const std::uint8_t*>(&iv), reinterpret_cast<const std::uint8_t*>(&iv) + sizeof(iv), ivBlock.begin());
 
-        CCCryptorStatus status = CCCrypt(operation, kCCAlgorithmAES128, kCCModeCTR,
+#ifdef __APPLE__
+        CCOperation op = operation == EOperation::Encrypt ? kCCEncrypt : kCCDecrypt;
+        CCCryptorStatus status = CCCrypt(op, kCCAlgorithmAES128, kCCModeCTR,
                                          m_key.data(), m_key.size(),
                                          ivBlock.data(),
                                          input, length,
@@ -104,6 +159,27 @@ private:
             std::cerr << __FUNCTION__ << ": CCCrypt failed with status " << status << std::endl;
             return false;
         }
+
+#elif defined(__linux__)
+        EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+        if (!ctx) return false;
+
+        if (1 != EVP_EncryptInit_ex(ctx, EVP_aes_128_ctr(), nullptr, m_key.data(), ivBlock.data())) {
+            EVP_CIPHER_CTX_free(ctx);
+            return false;
+        }
+
+        if (1 != EVP_EncryptUpdate(ctx, output, (int*)&outLength, input, length)) {
+            EVP_CIPHER_CTX_free(ctx);
+            return false;
+        }
+
+        EVP_CIPHER_CTX_free(ctx);
+
+#else
+#error
+#endif
+
         if (outLength != length) {
             std::cerr << __FUNCTION__ << ": Unexpected output length " << outLength << std::endl;
             return false;
@@ -232,8 +308,13 @@ bool EncryptIndex(const CAESECB& cipher, std::uint64_t index, std::uint64_t size
 
 TAESKey GenerateKeyFromString(const std::string& input, std::uint32_t numKeys)
 {
-    unsigned char hash[CC_SHA256_DIGEST_LENGTH];
+    std::uint8_t hash[256/8];
+
+#ifdef __APPLE__
     CC_SHA256(input.c_str(), static_cast<CC_LONG>(input.length()), hash);
+#elif defined(__linux__)
+    EVP_Digest(input.c_str(), input.length(), hash, nullptr, EVP_sha256(), nullptr);
+#endif
 
     TAESKey key = {};
     std::copy(hash, hash + kAES128KeySize, key.begin());
@@ -255,25 +336,40 @@ std::string ToHex(const std::uint8_t* data, size_t length)
 class HighResTimer
 {
 public:
-    // Constructor: starts the timer
     HighResTimer()
     {
+#ifdef __APPLE__
         start_time = mach_absolute_time();
         mach_timebase_info(&timebase_info);
+#elif defined(__linux__)
+        clock_gettime(CLOCK_MONOTONIC, &start_time_linux);
+#endif
     }
 
-    // Method to get the elapsed time in nanoseconds
     uint64_t GetElapsedNanoseconds() const
     {
+#ifdef __APPLE__
         uint64_t end_time = mach_absolute_time();
         uint64_t elapsed_ticks = end_time - start_time;
         // Convert elapsed ticks to nanoseconds using timebase_info
         return elapsed_ticks * timebase_info.numer / timebase_info.denom;
+#elif defined(__linux__)
+        // On Linux, use clock_gettime to calculate elapsed time
+        struct timespec end_time_linux;
+        clock_gettime(CLOCK_MONOTONIC, &end_time_linux);
+        
+        uint64_t elapsed_ns = (end_time_linux.tv_sec - start_time_linux.tv_sec) * 1000000000L + 
+                               (end_time_linux.tv_nsec - start_time_linux.tv_nsec);
+        return elapsed_ns;
+#endif
     }
 
-private:
+#ifdef __APPLE__
     uint64_t start_time;
     mach_timebase_info_data_t timebase_info;
+#elif defined(__linux__)
+    struct timespec start_time_linux;
+#endif
 };
 
 struct Options
@@ -664,6 +760,23 @@ private:
     std::condition_variable                     m_conditionVariable;
 };
 
+
+void GenerateRandomBytes(std::uint8_t* buffer, size_t length)
+{
+#ifdef __APPLE__
+    int result = SecRandomCopyBytes(kSecRandomDefault, length, buffer);
+    if (result != 0) {
+        throw std::runtime_error("Error: SecRandomCopyBytes failed with error " << std::to_string(result));
+    }
+#elif defined(__linux__)
+    int result = RAND_bytes(buffer, length) ? 0 : 1;
+    if (result != 1) {
+        throw std::runtime_error("Error: RAND_bytes failed");
+    }
+#endif
+}
+
+
 const std::string helpMessage = R"""(
 Scan a disk for bad blocks by writing and reading back data in a random order. This have several
 advantages over the traditional badblocks program:
@@ -894,15 +1007,12 @@ int main(int argc, char *argv[])
         iterationOrderKey = GenerateKeyFromString("pattern_iteration_" + *opts.pattern, 0);
     }
     else {
-        int result = SecRandomCopyBytes(kSecRandomDefault, iterationOrderKey.size(), iterationOrderKey.data());
-        if (result != 0) {
-            std::cerr << "Error: SecRandomCopyBytes failed with error " << result << std::endl;
-            return 1;
+        try {
+            GenerateRandomBytes(iterationOrderKey.data(), iterationOrderKey.size());
+            GenerateRandomBytes(dataKey.data(), dataKey.size());
         }
-
-        result = SecRandomCopyBytes(kSecRandomDefault, dataKey.size(), dataKey.data());
-        if (result != 0) {
-            std::cerr << "Error: SecRandomCopyBytes failed with error " << result << std::endl;
+        catch (const std::runtime_error& e) {
+            std::cout << e.what() << std::endl;
             return 1;
         }
     }

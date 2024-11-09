@@ -2,6 +2,7 @@ build/
 *.o
 *.out
 *.a
+CryptoBadBlocks
 *.dSYM/
 CMakeFiles/
 CMakeCache.txt

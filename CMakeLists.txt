@@ -15,7 +15,7 @@ elseif(UNIX)
     add_definitions(-DMAC=0)
     # Assume OpenSSL on Unix-like platforms (Linux, BSD)
     find_package(OpenSSL REQUIRED)
-    set(PLATFORM_LIBS OpenSSL::Crypto)
+    set(PLATFORM_LIBS OpenSSL::Crypto pthread)
 elseif(WIN32)
     add_definitions(-DMAC=0)
     # Use Windows built-in crypto library
