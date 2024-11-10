@@ -387,6 +387,9 @@ public:
 #endif
     }
 
+    CHighResTimer(const CHighResTimer&) = delete;
+    CHighResTimer& operator=(const CHighResTimer&) = delete;
+
     uint64_t GetElapsedNanoseconds() const
     {
 #ifdef __APPLE__
@@ -440,6 +443,39 @@ private:
     CHighResTimer       m_timer;
     std::uint64_t       m_periodInNanoseconds = 0;
     std::uint64_t       m_lastTime = 0;
+};
+
+class CBytesPerSecondEstimator
+{
+public:
+    
+    void Update(std::uint64_t totalNumBytes)
+    {
+        std::uint64_t currentTime = m_timer.GetElapsedNanoseconds();
+        std::uint64_t elapsedTime = currentTime - m_lastEstimationTime;
+        if (elapsedTime < 500 * 1000 * 1000) { // 500 ms
+            return;
+        }
+
+        std::uint64_t bytesSinceLastEstimation = totalNumBytes - m_numBytesAtLastEstimation;
+        double bytesPerSecond = static_cast<double>(bytesSinceLastEstimation) / elapsedTime * 1000 * 1000 * 1000;
+        double oldWeight = m_lastEstimationTime == 0 ? 0.0 : 0.25;
+        double newWeight = 1.0 - oldWeight;
+        m_lastEstimationBytesPerSecond = m_lastEstimationBytesPerSecond * oldWeight + bytesPerSecond * newWeight;
+
+        m_numBytesAtLastEstimation = totalNumBytes;
+        m_lastEstimationTime = currentTime;
+    }
+
+    double GetBytesPerSecondEstimation() const {
+        return m_lastEstimationBytesPerSecond;
+    }
+
+private : 
+    CHighResTimer m_timer;
+    std::uint64_t       m_lastEstimationTime = 0;
+    std::uint64_t       m_numBytesAtLastEstimation = 0;
+    double              m_lastEstimationBytesPerSecond = 0;
 };
 
 
@@ -583,6 +619,23 @@ std::vector<std::pair<std::uint64_t, std::uint64_t> > CalculateRanges(
 }
 
 
+std::string FormatTime(std::uint32_t seconds)
+{
+    std::uint32_t hours = seconds / 3600;
+    std::uint32_t minutes = (seconds % 3600) / 60;
+    std::uint32_t secs = seconds % 60;
+
+    std::ostringstream oss;
+    if (hours > 0)
+    {
+        oss << std::setw(2) << std::setfill('0') << hours << ":";
+    }
+    oss << std::setw(2) << std::setfill('0') << minutes << ":"
+        << std::setw(2) << std::setfill('0') << secs;
+
+    return oss.str();
+}
+
 class CMain {
 
 public:
@@ -652,6 +705,7 @@ public:
         std::uint64_t totalBytesWritten = 0;
         std::uint64_t totalBytesRead = 0;
 
+        CBytesPerSecondEstimator bytesPerSecondEstimator;
         CPeriodicTimer periodicTimer(1000 * 1000 * 1000); // 1 second
         CHighResTimer totalTimer;
 
@@ -782,22 +836,11 @@ public:
 
             if (periodicTimer.IsTimeToRun() || numQueuedWorkItems == 0) {
                 std::uint32_t elapsedSeconds = totalTimer.GetElapsedNanoseconds() / 1000 / 1000 / 1000;
-                std::string elapsedHours = std::to_string(elapsedSeconds / 3600);
-                std::string elapsedMinutes = std::to_string((elapsedSeconds % 3600) / 60);
-                if (elapsedMinutes.size() == 1) {
-                    elapsedMinutes = "0" + elapsedMinutes;
-                }
-                std::string elapsedSecondsRemainder = std::to_string(elapsedSeconds % 60);
-                if (elapsedSecondsRemainder.size() == 1) {
-                    elapsedSecondsRemainder = "0" + elapsedSecondsRemainder;
-                }
-                std::string elapsedTime = elapsedSecondsRemainder;
-                if (elapsedHours != "0") {
-                    elapsedTime = elapsedHours + ":" + elapsedMinutes + ":" + elapsedTime;
-                }
-                else {
-                    elapsedTime = elapsedMinutes + ":" + elapsedTime;
-                }
+
+                bytesPerSecondEstimator.Update(totalBytesWritten + totalBytesRead);
+                double bytesPerSecond = bytesPerSecondEstimator.GetBytesPerSecondEstimation();
+                std::uint64_t bytesLeft = (numBlocksToTest * 2 - writeIndex - readIndex) * options.blockSize;
+                std::uint32_t secondsLeft = bytesLeft / bytesPerSecond;
 
                 // Multiply by 1000 and dividing by 1000.0 to round down.
                 double progress = (writeIndex + readIndex) * 1000 / (numBlocksToTest * 2) / 1000.0;
@@ -805,8 +848,12 @@ public:
                 std::cout << "\rProgress: " << std::fixed << std::setprecision(1) << 100.0 * progress << " %"
                     << " (" << writeFailureOffsets.size() << "/" 
                     << readFailureOffsets.size() << "/" 
-                    << verificationFailureOffsets.size() << ")"
-                    << " in " << elapsedTime << std::flush;
+                    << verificationFailureOffsets.size() 
+                    << " w/r/v failures)"
+                    << " in " << FormatTime(elapsedSeconds)
+                    << ", " << std::fixed << std::setprecision(1) << bytesPerSecond / 1024 / 1024 << " MiB/s"
+                    << ", " << FormatTime(secondsLeft) << " left"
+                    << std::flush;
             }
 
         } while (numQueuedWorkItems > 0);
