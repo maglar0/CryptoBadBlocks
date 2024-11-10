@@ -579,6 +579,8 @@ public:
         std::uint64_t totalBytesWritten = 0;
         std::uint64_t totalBytesRead = 0;
 
+        CHighResTimer totalTimer;
+
         std::uint64_t writeIndex = 0;
         std::uint64_t readIndex = 0;
         do {
@@ -704,34 +706,39 @@ public:
 
         } while (numQueuedWorkItems > 0);
 
-        {
-            double totalWriteTimeInSeconds = std::accumulate(writeLatencyInMicroseconds.begin(), writeLatencyInMicroseconds.end(), 0.0) / 1000.0 / 1000.0;
-            std::sort(writeLatencyInMicroseconds.begin(), writeLatencyInMicroseconds.end());
-            std::cout << "Write latency (ms): " << std::fixed << std::setprecision(1) << "\n"
-                        << "  Min: " << writeLatencyInMicroseconds.front() / 1000.0 << "\n"
-                        << "  Max: " << writeLatencyInMicroseconds.back() / 1000.0 << "\n"
-                        << "  1 %: " << writeLatencyInMicroseconds[writeLatencyInMicroseconds.size() / 100] / 1000.0 << "\n"
-                        << "  10 %: " << writeLatencyInMicroseconds[writeLatencyInMicroseconds.size() / 10] / 1000.0 << "\n"
-                        << "  50 %: " << writeLatencyInMicroseconds[writeLatencyInMicroseconds.size() / 2] / 1000.0 << "\n"
-                        << "  90 %: " << writeLatencyInMicroseconds[writeLatencyInMicroseconds.size() * 9 / 10] / 1000.0 << "\n"
-                        << "  99 %: " << writeLatencyInMicroseconds[writeLatencyInMicroseconds.size() * 99 / 100] / 1000.0 << "\n"
-                        << "  Avg: " << totalWriteTimeInSeconds * 1000.0 / writeLatencyInMicroseconds.size() << std::endl;
-            std::cout << "Write speed: " << std::fixed << std::setprecision(1) << totalBytesWritten / totalWriteTimeInSeconds / 1024.0 / 1024.0 << " MiB/s" << std::endl;
-        }
-        {
-            double totalReadTimeInSeconds = std::accumulate(readLatencyInMicroseconds.begin(), readLatencyInMicroseconds.end(), 0.0) / 1000.0 / 1000.0;
-            std::sort(readLatencyInMicroseconds.begin(), readLatencyInMicroseconds.end());
-            std::cout << "Read latency (ms): " << std::fixed << std::setprecision(1) << "\n"
-                        << "  Min: " << readLatencyInMicroseconds.front() / 1000.0 << "\n"
-                        << "  Max: " << readLatencyInMicroseconds.back() / 1000.0 << "\n"
-                        << "  1 %: " << readLatencyInMicroseconds[readLatencyInMicroseconds.size() / 100] / 1000.0 << "\n"
-                        << "  10 %: " << readLatencyInMicroseconds[readLatencyInMicroseconds.size() / 10] / 1000.0 << "\n"
-                        << "  50 %: " << readLatencyInMicroseconds[readLatencyInMicroseconds.size() / 2] / 1000.0 << "\n"
-                        << "  90 %: " << readLatencyInMicroseconds[readLatencyInMicroseconds.size() * 9 / 10] / 1000.0 << "\n"
-                        << "  99 %: " << readLatencyInMicroseconds[readLatencyInMicroseconds.size() * 99 / 100] / 1000.0 << "\n"
-                        << "  Avg: " << totalReadTimeInSeconds * 1000.0 / readLatencyInMicroseconds.size() << std::endl;
-            std::cout << "Read speed: " << std::fixed << std::setprecision(1) << totalBytesRead / totalReadTimeInSeconds / 1024.0 / 1024.0 << " MiB/s" << std::endl;
-        }
+        const double totalTestTimeInSeconds = totalTimer.GetElapsedNanoseconds() / 1000.0 / 1000.0 / 1000.0;
+        const double totalWriteTimeInSeconds = std::accumulate(writeLatencyInMicroseconds.begin(), writeLatencyInMicroseconds.end(), 0.0) / 1000.0 / 1000.0;
+        const double totalReadTimeInSeconds = std::accumulate(readLatencyInMicroseconds.begin(), readLatencyInMicroseconds.end(), 0.0) / 1000.0 / 1000.0;
+
+        std::sort(writeLatencyInMicroseconds.begin(), writeLatencyInMicroseconds.end());
+        std::cout << "Write latency (ms): " << std::fixed << std::setprecision(1) << "\n"
+                    << "  Min: " << writeLatencyInMicroseconds.front() / 1000.0 << "\n"
+                    << "  Max: " << writeLatencyInMicroseconds.back() / 1000.0 << "\n"
+                    << "  1 %: " << writeLatencyInMicroseconds[writeLatencyInMicroseconds.size() / 100] / 1000.0 << "\n"
+                    << "  10 %: " << writeLatencyInMicroseconds[writeLatencyInMicroseconds.size() / 10] / 1000.0 << "\n"
+                    << "  50 %: " << writeLatencyInMicroseconds[writeLatencyInMicroseconds.size() / 2] / 1000.0 << "\n"
+                    << "  90 %: " << writeLatencyInMicroseconds[writeLatencyInMicroseconds.size() * 9 / 10] / 1000.0 << "\n"
+                    << "  99 %: " << writeLatencyInMicroseconds[writeLatencyInMicroseconds.size() * 99 / 100] / 1000.0 << "\n"
+                    << "  Avg: " << totalWriteTimeInSeconds * 1000.0 / writeLatencyInMicroseconds.size() << std::endl;
+        std::cout << "Write speed: " << std::fixed << std::setprecision(1) << totalBytesWritten / totalWriteTimeInSeconds / 1024.0 / 1024.0 << " MiB/s" << std::endl;
+
+        std::sort(readLatencyInMicroseconds.begin(), readLatencyInMicroseconds.end());
+        std::cout << "Read latency (ms): " << std::fixed << std::setprecision(1) << "\n"
+                    << "  Min: " << readLatencyInMicroseconds.front() / 1000.0 << "\n"
+                    << "  Max: " << readLatencyInMicroseconds.back() / 1000.0 << "\n"
+                    << "  1 %: " << readLatencyInMicroseconds[readLatencyInMicroseconds.size() / 100] / 1000.0 << "\n"
+                    << "  10 %: " << readLatencyInMicroseconds[readLatencyInMicroseconds.size() / 10] / 1000.0 << "\n"
+                    << "  50 %: " << readLatencyInMicroseconds[readLatencyInMicroseconds.size() / 2] / 1000.0 << "\n"
+                    << "  90 %: " << readLatencyInMicroseconds[readLatencyInMicroseconds.size() * 9 / 10] / 1000.0 << "\n"
+                    << "  99 %: " << readLatencyInMicroseconds[readLatencyInMicroseconds.size() * 99 / 100] / 1000.0 << "\n"
+                    << "  Avg: " << totalReadTimeInSeconds * 1000.0 / readLatencyInMicroseconds.size() << std::endl;
+        std::cout << "Read speed: " << std::fixed << std::setprecision(1) << totalBytesRead / totalReadTimeInSeconds / 1024.0 / 1024.0 << " MiB/s" << std::endl;
+
+        std::cout << "Total time: " << std::fixed << std::setprecision(1) << totalTestTimeInSeconds << " s" << std::endl;
+        std::cout << "  of which: " << std::fixed << std::setprecision(1) << totalWriteTimeInSeconds << " s writing \n" 
+                  << "            " << totalReadTimeInSeconds << " s reading\n"
+                  << "            " << totalWriteTimeInSeconds + totalReadTimeInSeconds << " s reading/writing" << std::endl;
+
     }
 
 private:
