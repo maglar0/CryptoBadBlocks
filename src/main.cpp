@@ -53,6 +53,51 @@ typedef std::array<std::uint8_t, kAESBlockSize> TAESBlock;
         } \
     } while (0)
 
+template <typename T, std::size_t Alignment>
+struct CAlignedAllocator
+{
+    using value_type = T;
+
+    CAlignedAllocator() = default;
+
+    template <typename U>
+    constexpr CAlignedAllocator(const CAlignedAllocator<U, Alignment> &) noexcept {}
+
+    T *allocate(std::size_t n)
+    {
+        // Ensure size is a multiple of alignment (required by std::aligned_alloc)
+        std::size_t size = n * sizeof(T);
+        if (size % Alignment != 0)
+        {
+            size += Alignment - (size % Alignment);
+        }
+        return static_cast<T *>(std::aligned_alloc(Alignment, size));
+    }
+
+    void deallocate(T *ptr, std::size_t) noexcept
+    {
+        std::free(ptr);
+    }
+
+    // Required for compatibility with standard containers
+    template <typename U>
+    struct rebind
+    {
+        using other = CAlignedAllocator<U, Alignment>;
+    };
+};
+
+template <typename T, std::size_t Alignment>
+bool operator==(const CAlignedAllocator<T, Alignment> &, const CAlignedAllocator<T, Alignment> &)
+{
+    return true;
+}
+
+template <typename T, std::size_t Alignment>
+bool operator!=(const CAlignedAllocator<T, Alignment> &, const CAlignedAllocator<T, Alignment> &)
+{
+    return false;
+}
 
 class CAESECB
 {
@@ -329,10 +374,10 @@ std::string ToHex(const std::uint8_t* data, size_t length)
     return oss.str();
 }
 
-class HighResTimer
+class CHighResTimer
 {
 public:
-    HighResTimer()
+    CHighResTimer()
     {
 #ifdef __APPLE__
         start_time = mach_absolute_time();
@@ -381,18 +426,18 @@ struct Options
     std::string device;
 };
 
-class FileDescriptor
+class CFileDescriptor
 {
 public:
-    explicit FileDescriptor(int fd) : m_fd(fd) {}
+    explicit CFileDescriptor(int fd) : m_fd(fd) {}
 
-    FileDescriptor(const FileDescriptor &) = delete;
-    FileDescriptor &operator=(const FileDescriptor &) = delete;
+    CFileDescriptor(const CFileDescriptor &) = delete;
+    CFileDescriptor &operator=(const CFileDescriptor &) = delete;
 
-    FileDescriptor(FileDescriptor &&other) noexcept : m_fd(std::exchange(other.m_fd, -1)) {}
+    CFileDescriptor(CFileDescriptor &&other) noexcept : m_fd(std::exchange(other.m_fd, -1)) {}
 
     // Move assignment operator
-    FileDescriptor &operator=(FileDescriptor &&other) noexcept
+    CFileDescriptor &operator=(CFileDescriptor &&other) noexcept
     {
         if (this != &other)
         {
@@ -402,7 +447,7 @@ public:
         return *this;
     }
 
-    ~FileDescriptor()
+    ~CFileDescriptor()
     {
         Close();
     }
@@ -419,12 +464,16 @@ private:
     }
 };
 
-FileDescriptor OpenDevice(const std::string& devicePath) {
-    int fd = ::open(devicePath.c_str(), O_RDWR | O_SYNC);
+CFileDescriptor OpenDevice(const std::string& devicePath) {
+    int flags = O_RDWR | O_SYNC;
+#ifdef __linux__
+    flags |= O_DIRECT;
+#endif // __linux__
+    int fd = ::open(devicePath.c_str(), flags);
     if (fd < 0) {
         throw std::runtime_error("Error: Failed to open device " + devicePath);
     }
-    return FileDescriptor(fd);
+    return CFileDescriptor(fd);
 }
 
 
@@ -526,6 +575,9 @@ public:
         std::vector<std::uint32_t> readLatencyInMicroseconds;
         writeLatencyInMicroseconds.reserve(numBlocksToTest);
         readLatencyInMicroseconds.reserve(numBlocksToTest);
+
+        std::uint64_t totalBytesWritten = 0;
+        std::uint64_t totalBytesRead = 0;
 
         std::uint64_t writeIndex = 0;
         std::uint64_t readIndex = 0;
@@ -629,6 +681,7 @@ public:
                         std::cerr << "Error: Write failed for block " << blockIndex << std::endl;
                     }
                     writeLatencyInMicroseconds.push_back(workItem->durationInNanoseconds/1000);
+                    totalBytesWritten += workItem->data.size();
                 }
                 else {
                     if (!workItem->success) {
@@ -644,6 +697,7 @@ public:
                         std::cerr << "Error: Verification failed for block " << blockIndex << std::endl;
                     }
                     readLatencyInMicroseconds.push_back(workItem->durationInNanoseconds/1000);
+                    totalBytesRead += workItem->data.size();
                 }
                 workItemBuffer.push_back(std::move(workItem));
             }
@@ -651,6 +705,7 @@ public:
         } while (numQueuedWorkItems > 0);
 
         {
+            double totalWriteTimeInSeconds = std::accumulate(writeLatencyInMicroseconds.begin(), writeLatencyInMicroseconds.end(), 0.0) / 1000.0 / 1000.0;
             std::sort(writeLatencyInMicroseconds.begin(), writeLatencyInMicroseconds.end());
             std::cout << "Write latency (ms): " << std::fixed << std::setprecision(1) << "\n"
                         << "  Min: " << writeLatencyInMicroseconds.front() / 1000.0 << "\n"
@@ -660,9 +715,11 @@ public:
                         << "  50 %: " << writeLatencyInMicroseconds[writeLatencyInMicroseconds.size() / 2] / 1000.0 << "\n"
                         << "  90 %: " << writeLatencyInMicroseconds[writeLatencyInMicroseconds.size() * 9 / 10] / 1000.0 << "\n"
                         << "  99 %: " << writeLatencyInMicroseconds[writeLatencyInMicroseconds.size() * 99 / 100] / 1000.0 << "\n"
-                        << "  Avg: " << std::accumulate(writeLatencyInMicroseconds.begin(), writeLatencyInMicroseconds.end(), 0.0) / 1000.0 / writeLatencyInMicroseconds.size() << std::endl;
+                        << "  Avg: " << totalWriteTimeInSeconds * 1000.0 / writeLatencyInMicroseconds.size() << std::endl;
+            std::cout << "Write speed: " << std::fixed << std::setprecision(1) << totalBytesWritten / totalWriteTimeInSeconds / 1024.0 / 1024.0 << " MiB/s" << std::endl;
         }
         {
+            double totalReadTimeInSeconds = std::accumulate(readLatencyInMicroseconds.begin(), readLatencyInMicroseconds.end(), 0.0) / 1000.0 / 1000.0;
             std::sort(readLatencyInMicroseconds.begin(), readLatencyInMicroseconds.end());
             std::cout << "Read latency (ms): " << std::fixed << std::setprecision(1) << "\n"
                         << "  Min: " << readLatencyInMicroseconds.front() / 1000.0 << "\n"
@@ -672,7 +729,8 @@ public:
                         << "  50 %: " << readLatencyInMicroseconds[readLatencyInMicroseconds.size() / 2] / 1000.0 << "\n"
                         << "  90 %: " << readLatencyInMicroseconds[readLatencyInMicroseconds.size() * 9 / 10] / 1000.0 << "\n"
                         << "  99 %: " << readLatencyInMicroseconds[readLatencyInMicroseconds.size() * 99 / 100] / 1000.0 << "\n"
-                        << "  Avg: " << std::accumulate(readLatencyInMicroseconds.begin(), readLatencyInMicroseconds.end(), 0.0) / 1000.0 / readLatencyInMicroseconds.size() << std::endl;
+                        << "  Avg: " << totalReadTimeInSeconds * 1000.0 / readLatencyInMicroseconds.size() << std::endl;
+            std::cout << "Read speed: " << std::fixed << std::setprecision(1) << totalBytesRead / totalReadTimeInSeconds / 1024.0 / 1024.0 << " MiB/s" << std::endl;
         }
     }
 
@@ -687,7 +745,7 @@ private:
     {
         std::uint64_t offset = 0xFFFFFFFFFFFFFFFF; // Offset from start of device in bytes for the operation.
         Operation operation = Operation::Read;
-        std::vector<std::uint8_t> data; // Usually block size data, but smaller on last block, and empty when we're done.
+        std::vector<std::uint8_t, CAlignedAllocator<std::uint8_t, 8192>> data; // Usually block size data, but smaller on last block, and empty when we're done.
         bool success = false;
         std::uint64_t durationInNanoseconds = 0;
 
@@ -719,14 +777,14 @@ private:
                     workItem->durationInNanoseconds = 0;
                 }
                 else if (workItem->operation == Operation::Write) {
-                    HighResTimer timer;
+                    CHighResTimer timer;
                     int result = write(m_deviceFileDescriptor.Get(), workItem->data.data(), workItem->data.size());
                     fsync(m_deviceFileDescriptor.Get());
                     workItem->durationInNanoseconds = timer.GetElapsedNanoseconds();
                     workItem->success = result == static_cast<ssize_t>(workItem->data.size());
                 }
                 else {
-                    HighResTimer timer;
+                    CHighResTimer timer;
                     int result = read(m_deviceFileDescriptor.Get(), workItem->data.data(), workItem->data.size());;
                     workItem->durationInNanoseconds = timer.GetElapsedNanoseconds();
                     workItem->success = result == static_cast<ssize_t>(workItem->data.size());
@@ -746,7 +804,7 @@ private:
         }
     }
 
-    FileDescriptor                              m_deviceFileDescriptor;
+    CFileDescriptor                             m_deviceFileDescriptor;
     std::thread                                 m_workerThread;
 
     std::vector<std::unique_ptr<WorkItem> >     m_workQueue;
