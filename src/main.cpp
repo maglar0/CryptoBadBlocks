@@ -413,6 +413,36 @@ public:
 #endif
 };
 
+
+class CPeriodicTimer
+{
+public:
+    CPeriodicTimer(std::uint64_t periodInNanoseconds)
+        : m_periodInNanoseconds(periodInNanoseconds)
+    {
+        EXPECT(periodInNanoseconds > 0, "Period must be greater than zero");
+        m_lastTime = m_timer.GetElapsedNanoseconds();
+    }
+
+    bool IsTimeToRun() {
+        std::uint64_t currentTime = m_timer.GetElapsedNanoseconds();
+        
+        std::uint64_t currentCycle = currentTime / m_periodInNanoseconds;
+        std::uint64_t lastCycle = m_lastTime / m_periodInNanoseconds;
+        if (currentCycle > lastCycle) {
+            m_lastTime = currentTime;
+            return true;
+        }
+        return false;
+    }
+
+private:
+    CHighResTimer       m_timer;
+    std::uint64_t       m_periodInNanoseconds = 0;
+    std::uint64_t       m_lastTime = 0;
+};
+
+
 struct Options
 {
     std::uint64_t blockSize = 1024 * 1024; // default 1M
@@ -520,6 +550,38 @@ std::uint32_t GetBlockSize(int fd)
 }
 
 
+std::vector<std::pair<std::uint64_t, std::uint64_t> > CalculateRanges(
+    const std::vector<std::uint64_t>& sortedOffsets, 
+    std::uint64_t blockSize,
+    std::uint64_t deviceSize)
+{
+    EXPECT(blockSize > 0, "blockSize must be greater than zero");
+    EXPECT(std::is_sorted(sortedOffsets.begin(), sortedOffsets.end()), "sortedOffsets is not sorted");
+
+    std::vector<std::pair<std::uint64_t, std::uint64_t> > ranges;
+    if (sortedOffsets.empty()) {
+        return ranges;
+    }
+
+    std::uint64_t start = sortedOffsets.front();
+    std::uint64_t end = start + blockSize;
+    for (size_t i = 1; i < sortedOffsets.size(); ++i) {
+        if (sortedOffsets[i] == end) {
+            end += blockSize;
+        }
+        else {
+            ranges.emplace_back(start, end);
+            start = sortedOffsets[i];
+            end = start + blockSize;
+        }
+    }
+    if (end > deviceSize) {
+        end = deviceSize;
+    }
+    ranges.emplace_back(start, end);
+    return ranges;
+}
+
 
 class CMain {
 
@@ -576,9 +638,21 @@ public:
         writeLatencyInMicroseconds.reserve(numBlocksToTest);
         readLatencyInMicroseconds.reserve(numBlocksToTest);
 
+        std::vector<std::uint64_t> readFailureOffsets;
+        std::vector<std::uint64_t> writeFailureOffsets;
+        std::vector<std::uint64_t> verificationFailureOffsets;
+        readFailureOffsets.reserve(numBlocksToTest);
+        writeFailureOffsets.reserve(numBlocksToTest);
+        verificationFailureOffsets.reserve(numBlocksToTest);
+
+        // An update will be printed every second, and it will print using "\r" to overwrite the previous line,
+        // so we need to make an empty line for it for the first update.
+        std::cout << std::endl;
+
         std::uint64_t totalBytesWritten = 0;
         std::uint64_t totalBytesRead = 0;
 
+        CPeriodicTimer periodicTimer(1000 * 1000 * 1000); // 1 second
         CHighResTimer totalTimer;
 
         std::uint64_t writeIndex = 0;
@@ -680,23 +754,25 @@ public:
 
                 if (workItem->operation == Operation::Write) {
                     if (!workItem->success) {
-                        std::cerr << "Error: Write failed for block " << blockIndex << std::endl;
+                        writeFailureOffsets.push_back(workItem->offset);
                     }
                     writeLatencyInMicroseconds.push_back(workItem->durationInNanoseconds/1000);
                     totalBytesWritten += workItem->data.size();
                 }
                 else {
                     if (!workItem->success) {
-                        std::cerr << "Error: Read failed for block " << blockIndex << std::endl;
+                        readFailureOffsets.push_back(workItem->offset);
                     }
-                    std::uint64_t iv = workItem->offset;
-                    EXPECT(workItem->data.size() <= verificationBuffer.size(), "workItem->data.size() > verificationBuffer.size()");
-                    bool success = dataCipher.Decrypt(workItem->data.data(), verificationBuffer.data(), workItem->data.size(), iv);
-                    if (!success) {
-                        throw std::runtime_error("Error: Failed to decrypt data for block " + std::to_string(blockIndex));
-                    }
-                    if (std::memcmp(zeros.data(), verificationBuffer.data(), workItem->data.size()) != 0) {
-                        std::cerr << "Error: Verification failed for block " << blockIndex << std::endl;
+                    else {
+                        std::uint64_t iv = workItem->offset;
+                        EXPECT(workItem->data.size() <= verificationBuffer.size(), "workItem->data.size() > verificationBuffer.size()");
+                        bool success = dataCipher.Decrypt(workItem->data.data(), verificationBuffer.data(), workItem->data.size(), iv);
+                        if (!success) {
+                            throw std::runtime_error("Error: Failed to decrypt data for block " + std::to_string(blockIndex));
+                        }
+                        if (std::memcmp(zeros.data(), verificationBuffer.data(), workItem->data.size()) != 0) {
+                            verificationFailureOffsets.push_back(workItem->offset);
+                        }
                     }
                     readLatencyInMicroseconds.push_back(workItem->durationInNanoseconds/1000);
                     totalBytesRead += workItem->data.size();
@@ -704,11 +780,42 @@ public:
                 workItemBuffer.push_back(std::move(workItem));
             }
 
+            if (periodicTimer.IsTimeToRun() || numQueuedWorkItems == 0) {
+                std::uint32_t elapsedSeconds = totalTimer.GetElapsedNanoseconds() / 1000 / 1000 / 1000;
+                std::string elapsedHours = std::to_string(elapsedSeconds / 3600);
+                std::string elapsedMinutes = std::to_string((elapsedSeconds % 3600) / 60);
+                if (elapsedMinutes.size() == 1) {
+                    elapsedMinutes = "0" + elapsedMinutes;
+                }
+                std::string elapsedSecondsRemainder = std::to_string(elapsedSeconds % 60);
+                if (elapsedSecondsRemainder.size() == 1) {
+                    elapsedSecondsRemainder = "0" + elapsedSecondsRemainder;
+                }
+                std::string elapsedTime = elapsedSecondsRemainder;
+                if (elapsedHours != "0") {
+                    elapsedTime = elapsedHours + ":" + elapsedMinutes + ":" + elapsedTime;
+                }
+                else {
+                    elapsedTime = elapsedMinutes + ":" + elapsedTime;
+                }
+
+                // Multiply by 1000 and dividing by 1000.0 to round down.
+                double progress = (writeIndex + readIndex) * 1000 / (numBlocksToTest * 2) / 1000.0;
+
+                std::cout << "\rProgress: " << std::fixed << std::setprecision(1) << 100.0 * progress << " %"
+                    << " (" << writeFailureOffsets.size() << "/" 
+                    << readFailureOffsets.size() << "/" 
+                    << verificationFailureOffsets.size() << ")"
+                    << " in " << elapsedTime << std::flush;
+            }
+
         } while (numQueuedWorkItems > 0);
 
         const double totalTestTimeInSeconds = totalTimer.GetElapsedNanoseconds() / 1000.0 / 1000.0 / 1000.0;
         const double totalWriteTimeInSeconds = std::accumulate(writeLatencyInMicroseconds.begin(), writeLatencyInMicroseconds.end(), 0.0) / 1000.0 / 1000.0;
         const double totalReadTimeInSeconds = std::accumulate(readLatencyInMicroseconds.begin(), readLatencyInMicroseconds.end(), 0.0) / 1000.0 / 1000.0;
+
+        std::cout << std::endl;
 
         std::sort(writeLatencyInMicroseconds.begin(), writeLatencyInMicroseconds.end());
         std::cout << "Write latency (ms): " << std::fixed << std::setprecision(1) << "\n"
@@ -739,6 +846,32 @@ public:
                   << "            " << totalReadTimeInSeconds << " s reading\n"
                   << "            " << totalWriteTimeInSeconds + totalReadTimeInSeconds << " s reading/writing" << std::endl;
 
+        std::sort(writeFailureOffsets.begin(), writeFailureOffsets.end());
+        std::sort(readFailureOffsets.begin(), readFailureOffsets.end());
+        std::sort(verificationFailureOffsets.begin(), verificationFailureOffsets.end());
+
+        std::vector<std::pair<std::uint64_t, std::uint64_t> > writeFailureRanges = CalculateRanges(writeFailureOffsets, options.blockSize, deviceSize);
+        std::vector<std::pair<std::uint64_t, std::uint64_t> > readFailureRanges = CalculateRanges(readFailureOffsets, options.blockSize, deviceSize);
+        std::vector<std::pair<std::uint64_t, std::uint64_t> > verificationFailureRanges = CalculateRanges(verificationFailureOffsets, options.blockSize, deviceSize);
+
+        std::cout << "Write failures: " << writeFailureOffsets.size() << std::endl;
+        std::cout << "Read failures: " << readFailureOffsets.size() << std::endl;
+        std::cout << "Verification failures: " << verificationFailureOffsets.size() << std::endl;
+        size_t numFailureRanges = writeFailureRanges.size() + readFailureRanges.size() + verificationFailureRanges.size();
+        if (numFailureRanges > 0 && numFailureRanges < 50) {
+            std::cout << "Write failure ranges (in byte offsets from start of device): " << std::endl;
+            for (const auto& range : writeFailureRanges) {
+                std::cout << "  " << range.first << " - " << range.second << std::endl;
+            }
+            std::cout << "Read failure ranges: " << std::endl;
+            for (const auto& range : readFailureRanges) {
+                std::cout << "  " << range.first << " - " << range.second << std::endl;
+            }
+            std::cout << "Verification failure ranges: " << std::endl;
+            for (const auto& range : verificationFailureRanges) {
+                std::cout << "  " << range.first << " - " << range.second << std::endl;
+            }
+        }
     }
 
 private:
