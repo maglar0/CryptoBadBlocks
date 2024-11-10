@@ -487,6 +487,7 @@ struct Options
     bool resume = false;
     std::optional<std::string> seed;
     std::optional<std::string> pattern;
+    bool linear = false;
     bool noGraphs = false;
     std::string summaryFile;
     std::string device;
@@ -714,7 +715,10 @@ public:
         do {
             if (writeIndex < numBlocksToTest) {
                 std::uint64_t randomizedIndex = 0xFFFFFFFFFFFFFFFF;
-                if (!EncryptIndex(iterationOrderCipher, writeIndex, numBlocksOnDevice, randomizedIndex)) {
+                if (options.linear) {
+                    randomizedIndex = writeIndex;
+                }
+                else if (!EncryptIndex(iterationOrderCipher, writeIndex, numBlocksOnDevice, randomizedIndex)) {
                     throw std::runtime_error("Error: Failed to encrypt index " + std::to_string(writeIndex));
                 }
 
@@ -760,7 +764,10 @@ public:
 
             if (read) {
                 std::uint64_t randomizedIndex = 0xFFFFFFFFFFFFFFFF;
-                if (!EncryptIndex(iterationOrderCipher, readIndex, numBlocksOnDevice, randomizedIndex)) {
+                if (options.linear) {
+                    randomizedIndex = readIndex;
+                }
+                else if (!EncryptIndex(iterationOrderCipher, readIndex, numBlocksOnDevice, randomizedIndex)) {
                     throw std::runtime_error("Error: Failed to encrypt index " + std::to_string(readIndex));
                 }
 
@@ -906,17 +913,18 @@ public:
         std::cout << "Verification failures: " << verificationFailureOffsets.size() << std::endl;
         size_t numFailureRanges = writeFailureRanges.size() + readFailureRanges.size() + verificationFailureRanges.size();
         if (numFailureRanges > 0 && numFailureRanges < 50) {
-            std::cout << "Write failure ranges (in byte offsets from start of device): " << std::endl;
+            std::cout << "Failure ranges (in bytes from start of device): " << std::endl;
+            std::cout << "  Write:" << std::endl;
             for (const auto& range : writeFailureRanges) {
-                std::cout << "  " << range.first << " - " << range.second << std::endl;
+                std::cout << "    " << range.first << " - " << range.second << std::endl;
             }
-            std::cout << "Read failure ranges: " << std::endl;
+            std::cout << "  Read:" << std::endl;
             for (const auto& range : readFailureRanges) {
-                std::cout << "  " << range.first << " - " << range.second << std::endl;
+                std::cout << "    " << range.first << " - " << range.second << std::endl;
             }
-            std::cout << "Verification failure ranges: " << std::endl;
+            std::cout << "  Verification:" << std::endl;
             for (const auto& range : verificationFailureRanges) {
-                std::cout << "  " << range.first << " - " << range.second << std::endl;
+                std::cout << "    " << range.first << " - " << range.second << std::endl;
             }
         }
     }
@@ -1065,6 +1073,9 @@ able to resume a test that was interrupted (if --seed=SEED was used).
         Specify the pattern to use for writing. The pattern must be a string of hexadecimal digits,
         and is padded with zeros up the the closest larger power of 2 (e.g. 2, 4, 8, 16, 32, ...).
         This option is incompatible with -s. Default is no pattern, a random seed is used instead.
+  -l, --linear
+        Write and read the blocks in linear order. This is useful for testing the speed of the disk
+        without stressing it too much.
   -g, --no-graphs
         Do not show graphs at the end of the test.
   -u, --no-summary
@@ -1094,7 +1105,7 @@ Options parseCommandLine(int argc, char *argv[]) {
         {"-b", "--block-size="}, {"-c", "--count="}, {"-o", "--overlap="},
         {"-r", "--resume"}, {"-s", "--seed="}, {"-p", "--pattern="},
         {"-g", "--no-graphs"}, {"-u", "--summary="},
-        {"-h", "--help"}
+        {"-h", "--help"}, {"-l", "--linear"}
     };
 
     int i = 1;
@@ -1133,6 +1144,9 @@ Options parseCommandLine(int argc, char *argv[]) {
         } else if (arg == "-p" || arg.find(longOptions["-p"]) == 0) {
             std::string value = (arg == "-p") ? argv[++i] : arg.substr(longOptions["-p"].size());
             opts.pattern = value;
+
+        } else if (arg == "-l" || arg == longOptions["-l"]) {
+            opts.linear = true;
 
         } else if (arg == "-g" || arg == longOptions["-g"]) {
             opts.noGraphs = true;
