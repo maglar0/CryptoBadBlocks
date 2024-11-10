@@ -276,14 +276,10 @@ bool EncryptIndex(const CAESECB& cipher, std::uint64_t index, std::uint64_t size
     }
 
     // Calculate the smallest even power of 2 that is greater than or equal to size
-    std::uint64_t sizeInBits = 1;
+    std::uint64_t sizeInBits = 2;
     while (1ULL << sizeInBits < size)
     {
-        sizeInBits *= 2;
-    }
-    if (sizeInBits % 2 != 0)
-    {
-        sizeInBits++;
+        sizeInBits += 2;
     }
 
     std::uint64_t randomizedIndex = index;
@@ -727,13 +723,13 @@ private:
                     int result = write(m_deviceFileDescriptor.Get(), workItem->data.data(), workItem->data.size());
                     fsync(m_deviceFileDescriptor.Get());
                     workItem->durationInNanoseconds = timer.GetElapsedNanoseconds();
-                    workItem->success = result == static_cast<int>(workItem->data.size());
+                    workItem->success = result == static_cast<ssize_t>(workItem->data.size());
                 }
                 else {
                     HighResTimer timer;
                     int result = read(m_deviceFileDescriptor.Get(), workItem->data.data(), workItem->data.size());;
                     workItem->durationInNanoseconds = timer.GetElapsedNanoseconds();
-                    workItem->success = result == static_cast<int>(workItem->data.size());
+                    workItem->success = result == static_cast<ssize_t>(workItem->data.size());
                 }
 
                 {
