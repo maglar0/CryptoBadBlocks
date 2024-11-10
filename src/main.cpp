@@ -637,6 +637,30 @@ std::string FormatTime(std::uint32_t seconds)
     return oss.str();
 }
 
+
+
+
+std::vector<std::uint8_t> GeneratePattern(const std::optional<std::string>& pattern)
+{
+    std::vector<std::uint8_t> result;
+    if (!pattern.has_value()) {
+        return result;
+    }
+
+    EXPECT(pattern.value().size() % 2 == 0, "Pattern must have an even number of characters");
+
+    // For each 2 bytes in the pattern, convert them to a single byte and put in the result
+    for (size_t i = 0; i < pattern.value().size(); i += 2) {
+        std::string byteString = pattern.value().substr(i, 2);
+        std::uint8_t byte = static_cast<std::uint8_t>(std::stoul(byteString, nullptr, 16));
+        result.push_back(byte);
+    }
+
+    return result;
+}
+
+
+
 class CMain {
 
 public:
@@ -680,6 +704,7 @@ public:
         std::uint64_t numQueuedWorkItems = 0;
         const std::vector<std::uint8_t> zeros(options.blockSize);
         std::vector<std::uint8_t> verificationBuffer(options.blockSize);
+        const std::vector<std::uint8_t> pattern = GeneratePattern(options.pattern);
 
         // We have two things known as "block size", the device block size and the test block size. But from now on, block
         // always refers to the test blocks. Calculate the number of blocks on the device (rounding up, to cover the whole device). 
@@ -735,10 +760,17 @@ public:
                 bool isLastBlock = randomizedIndex == numBlocksOnDevice - 1;
                 std::uint64_t size = isLastBlock ? lastBlockSize : options.blockSize;
                 workItem->data.resize(size);
-                std::uint64_t iv = workItem->offset;
-                bool success = dataCipher.Encrypt(zeros.data(), workItem->data.data(), size, iv);
-                if (!success) {
-                    throw std::runtime_error("Error: Failed to encrypt data for block " + std::to_string(randomizedIndex));
+                if (!pattern.empty()) {
+                    for (size_t i = 0; i < workItem->data.size(); ++i) {
+                        workItem->data[i] = pattern[i % pattern.size()];
+                    }
+                }
+                else {
+                    std::uint64_t iv = workItem->offset;
+                    bool success = dataCipher.Encrypt(zeros.data(), workItem->data.data(), size, iv);
+                    if (!success) {
+                        throw std::runtime_error("Error: Failed to encrypt data for block " + std::to_string(randomizedIndex));
+                    }
                 }
 
                 {
@@ -823,6 +855,14 @@ public:
                 else {
                     if (!workItem->success) {
                         readFailureOffsets.push_back(workItem->offset);
+                    }
+                    else if (!pattern.empty()) {
+                        for (size_t i = 0; i < workItem->data.size(); ++i) {
+                            if (workItem->data[i] != pattern[i % pattern.size()]) {
+                                verificationFailureOffsets.push_back(workItem->offset);
+                                break;
+                            }
+                        }
                     }
                     else {
                         std::uint64_t iv = workItem->offset;
@@ -910,7 +950,7 @@ public:
 
         std::cout << "Write failures: " << writeFailureOffsets.size() << std::endl;
         std::cout << "Read failures: " << readFailureOffsets.size() << std::endl;
-        std::cout << "Verification failures: " << verificationFailureOffsets.size() << std::endl;
+        std::cout << "Verify failures: " << verificationFailureOffsets.size() << std::endl;
         size_t numFailureRanges = writeFailureRanges.size() + readFailureRanges.size() + verificationFailureRanges.size();
         if (numFailureRanges > 0 && numFailureRanges < 50) {
             std::cout << "Failure ranges (in bytes from start of device): " << std::endl;
@@ -1116,6 +1156,16 @@ Options parseCommandLine(int argc, char *argv[]) {
             std::string value = (arg == "-b") ? argv[++i] : arg.substr(longOptions["-b"].size());
             opts.blockSize = parseSize(value);
 
+            if (opts.blockSize == 0) {
+                throw std::invalid_argument("Error: --block-size must be greater than zero.");
+            }
+            if (opts.blockSize < 512) {
+                std::cerr << "Warning: --block-size smaller than 512 bytes is not recommended." << std::endl;
+            }
+            if (opts.blockSize % 512 != 0) {
+                std::cerr << "Warning: --block-size not a multiple of 512 bytes." << std::endl;
+            }
+
         } else if (arg == "-c" || arg.find(longOptions["-c"]) == 0) {
             std::string value = (arg == "-c") ? argv[++i] : arg.substr(longOptions["-c"].size());
             std::transform(value.begin(), value.end(), value.begin(), [](char c) { return std::toupper(c); });
@@ -1142,8 +1192,25 @@ Options parseCommandLine(int argc, char *argv[]) {
             opts.seed = value;
 
         } else if (arg == "-p" || arg.find(longOptions["-p"]) == 0) {
-            std::string value = (arg == "-p") ? argv[++i] : arg.substr(longOptions["-p"].size());
-            opts.pattern = value;
+            std::string pattern = (arg == "-p") ? argv[++i] : arg.substr(longOptions["-p"].size());
+
+            if (pattern.substr(0, 2) == "0x") {
+                pattern = pattern.substr(2);
+            }
+            if (pattern.empty()) {
+                throw std::invalid_argument("Error: Empty pattern.");
+            }
+            for (char c : pattern) {
+                if (!std::isxdigit(c)) {
+                    throw std::invalid_argument("Error: --pattern must be a string of hexadecimal digits.");
+                }
+            }
+
+            // Fill with zeros until the next power of 2
+            while (pattern.size() & (pattern.size() - 1)) {
+                pattern.insert(pattern.begin(), '0');
+            }
+            opts.pattern = pattern;
 
         } else if (arg == "-l" || arg == longOptions["-l"]) {
             opts.linear = true;
@@ -1185,30 +1252,12 @@ Options parseCommandLine(int argc, char *argv[]) {
         throw std::invalid_argument("No device specified.");
     }
 
-    if (opts.seed.has_value() && opts.pattern.has_value()) {
-        throw std::invalid_argument("Error: --seed and --pattern are incompatible.");
+    if (opts.pattern.has_value() && opts.pattern->size() / 2 > opts.blockSize) {
+        throw std::invalid_argument("Error: --pattern is larger than --block-size.");
     }
 
-    if (opts.pattern.has_value()) {
-        std::string pattern = *opts.pattern;
-        if (pattern.size() == 0) {
-            throw std::invalid_argument("Error: --pattern must have an even number of digits.");
-        }
-        for (char c : pattern) {
-            if (!std::isxdigit(c)) {
-                throw std::invalid_argument("Error: --pattern must be a string of hexadecimal digits.");
-            }
-        }
-
-        // Pad the pattern with zeros up to the closest larger power of 2
-        unsigned int smallestLargerPowerOf2 = 1;
-        while (smallestLargerPowerOf2 < pattern.size()) {
-            smallestLargerPowerOf2 *= 2;
-        }
-        if (smallestLargerPowerOf2 != pattern.size()) {
-            pattern.insert(0, smallestLargerPowerOf2 - pattern.size(), '0');
-        }
-        opts.pattern = pattern;
+    if (opts.seed.has_value() && opts.pattern.has_value()) {
+        throw std::invalid_argument("Error: --seed and --pattern are incompatible.");
     }
 
     if (opts.overlap > 0 && opts.resume) {
