@@ -769,7 +769,7 @@ void GenerateRandomBytes(std::uint8_t* buffer, size_t length)
         throw std::runtime_error("Error: SecRandomCopyBytes failed with error " + std::to_string(result));
     }
 #elif defined(__linux__)
-    int result = RAND_bytes(buffer, length) ? 0 : 1;
+    int result = RAND_bytes(buffer, length);
     if (result != 1) {
         throw std::runtime_error("Error: RAND_bytes failed");
     }
