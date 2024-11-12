@@ -99,6 +99,97 @@ bool operator!=(const CAlignedAllocator<T, Alignment> &, const CAlignedAllocator
     return false;
 }
 
+// Helper function to determine the number of logarithmic buckets
+int DetermineNumBuckets(double logMin, double logMax, int desiredBuckets)
+{
+    return static_cast<int>(std::ceil((logMax - logMin) * desiredBuckets));
+}
+
+// Function to generate and print logarithmic-scaled histogram
+void PrintHistogram(const std::vector<std::uint32_t> &data)
+{
+    if (data.empty())
+        return;
+
+    // This is very arbitrary but I a few outliers can screw up the whole
+    // histogram, so we ignore some points based on the size of the data when
+    // determining the bucket ranges.
+    size_t ignorePoints = 0;
+    if (data.size() > 1000) {
+        ignorePoints = 10;
+    }
+    else if (data.size() > 30) {
+        ignorePoints = 3;
+    }
+
+    // Step 1: Apply logarithmic transformation and find log min and max
+    double logMin = std::log10(*std::min_element(data.begin() + ignorePoints, data.end() - ignorePoints) / 1000.0 + 1);
+    double logMax = std::log10(*std::max_element(data.begin() + ignorePoints, data.end() - ignorePoints) / 1000.0 + 1);
+
+    // Step 2: Set bucket range in the logarithmic scale
+    int numBuckets = DetermineNumBuckets(logMin, logMax, 20);
+    std::vector<int> buckets(numBuckets, 0);
+
+    // Step 3: Populate buckets
+    for (auto time : data)
+    {
+        double logValue = std::log10(time / 1000.0 + 1);
+        int bucketIndex = static_cast<int>((logValue - logMin) / (logMax - logMin) * numBuckets);
+        if (bucketIndex < 0) {
+            bucketIndex = 0;
+        }
+        else if (bucketIndex >= numBuckets) {
+            bucketIndex = numBuckets - 1;
+        }
+        ++buckets[bucketIndex];
+    }
+
+    // Step 4: Find scaling factor for ASCII bars
+    int maxCount = *std::max_element(buckets.begin(), buckets.end());
+    int maxBarWidth = 50;
+    double scale = static_cast<double>(maxBarWidth) / maxCount;
+
+    int countNumberLength = static_cast<int>(std::log10(maxCount)+1);
+
+    // Step 5: Print histogram
+    for (int i = 0; i < numBuckets; ++i)
+    {
+        double bucketStart = std::pow(10, logMin + (i * (logMax - logMin) / numBuckets)) - 1;
+        double bucketEnd = std::pow(10, logMin + ((i + 1) * (logMax - logMin) / numBuckets)) - 1;
+        int count = buckets[i];
+        int barLength = static_cast<int>(count * scale);
+
+        // Format and print each row of the histogram
+        if (i == 0) {
+            std::cout << std::setw(7) << std::fixed << std::setprecision(1)
+                      << 0 << "-" << std::setw(7) << bucketEnd << " ms | ";
+        }
+        else if (i == numBuckets - 1) {
+            std::cout << std::setw(7) << std::fixed << std::setprecision(1)
+                      << bucketStart << "-        ms | ";
+        }
+        else {
+            std::cout << std::setw(7) << std::fixed << std::setprecision(1)
+                      << bucketStart << "-" << std::setw(7) << bucketEnd << " ms | ";
+        }
+        std::cout << " (" << std::setw(countNumberLength) << count << ")  ";
+        for (int j = 0; j < barLength; ++j) {
+            std::cout << "X";
+        }
+        std::cout << "\n";
+    }
+
+    // Step 6: Print horizontal axis label
+    std::cout << std::setw(26 + countNumberLength) << " " << "0 ";
+    for (int i = 1; i <= maxBarWidth / 10; ++i)
+    {
+        std::cout << std::setw(9) << i * (maxCount / maxBarWidth) * 10;
+    }
+    std::cout << " counts\n";
+}
+
+
+
 class CAESECB
 {
 public:
@@ -488,7 +579,7 @@ struct Options
     std::optional<std::string> seed;
     std::optional<std::string> pattern;
     bool linear = false;
-    bool noGraphs = false;
+    bool printGraphs = true;
     std::string summaryFile;
     std::string device;
 };
@@ -967,6 +1058,13 @@ public:
                 std::cout << "    " << range.first << " - " << range.second << std::endl;
             }
         }
+
+        if (options.printGraphs) {
+            std::cout << "Write latency histogram:" << std::endl;
+            PrintHistogram(writeLatencyInMicroseconds);
+            std::cout << "Read latency histogram:" << std::endl;
+            PrintHistogram(readLatencyInMicroseconds);
+        }
     }
 
 private:
@@ -1097,8 +1195,10 @@ able to resume a test that was interrupted (if --seed=SEED was used).
   -o, --overlap=PERCENT
         If larger than 0, the write operation is overlapped with reads, such that PERCENT of the
         writes are succeeded by a read operation, until all blocks have been written (at which
-        point only reads are performed). Default is 0 (i.e. write the whole device first, then
-        read the whole device to verify the data).
+        point only reads are performed). This might speed up the test if running on many disks
+        in parallel, since many of the buses in a computer are full duplex, e.g. PCI-E and SAS.
+        Default is 0 (i.e. write the whole device first, then read the whole device to verify 
+        the data).
   -r, --resume
         Scan for the last block written, and resume from there. This is useful if the program was
         interrupted and you want to continue where it left off. This will not work when overlap is
@@ -1216,7 +1316,7 @@ Options parseCommandLine(int argc, char *argv[]) {
             opts.linear = true;
 
         } else if (arg == "-g" || arg == longOptions["-g"]) {
-            opts.noGraphs = true;
+            opts.printGraphs = false;
 
         } else if (arg == "-u" || arg == longOptions["-u"]) {
             opts.summaryFile = (arg == "-u") ? argv[++i] : arg.substr(longOptions["-u"].size());
@@ -1289,7 +1389,7 @@ int main(int argc, char *argv[])
         std::cout << "Resume: " << (opts.resume ? "Yes" : "No") << "\n";
         std::cout << "Seed: " << (opts.seed ? *opts.seed : "Random") << "\n";
         std::cout << "Pattern: " << (opts.pattern ? *opts.pattern : "None") << "\n";
-        std::cout << "No graphs: " << (opts.noGraphs ? "Yes" : "No") << "\n";
+        std::cout << "Print graphs: " << (opts.printGraphs ? "Yes" : "No") << "\n";
         std::cout << "Summary file: " << opts.summaryFile << "\n";
         std::cout << "Device: " << opts.device << "\n";
     }
