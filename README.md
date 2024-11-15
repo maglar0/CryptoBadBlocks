@@ -9,7 +9,8 @@ It currently works on MacOS and Linux.
 
 ## Overview
 
-CryptoBadBlocks scans a disk for bad blocks by writing and reading data back in a random order. This method provides several benefits:
+CryptoBadBlocks scans a disk for bad blocks by writing and reading data back in a random order with unpredictable data. This method 
+provides several benefits:
 
 - **Increased Stress Testing**: Writing in random order can place greater stress on the disk, simulating a more realistic workload.
 - **SMR Disk Detection**: Shingled Magnetic Recording (SMR) disks often perform poorly when handling random writes, so this test can help 
@@ -19,7 +20,7 @@ figure out if the disk uses SMR.
 
 It also provides the following features:
 - **Resuming after interruption**: If the program was interrupted, e.g. because of a computer restart, it can quickly resume where it was (with
-some caveats, e.g. it can't verify write errors happening before the restart).
+some caveats, e.g. it can't report read/write errors happening before the restart).
 - **Overlapping writes with reads**: Some reads can be mixed in with the writing, instead of first writing the whole disk, and then reading it.
 - **Statistics about disk performance**: After completion, statistics about the disk performance is printed.
 - **Estimate of time left**: While working, an estimate of the time left is continuously printed. This can be quite accurate due to the
@@ -49,4 +50,4 @@ To build and run CryptoBadBlocks, follow these steps:
 
 ## Usage
 
-Run `bin/CryptoBadBlocks` for a full list of options and further information on usage.
+Run `bin/CryptoBadBlocks --help` for a full list of options and further information on usage.
