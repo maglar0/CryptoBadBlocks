@@ -803,6 +803,121 @@ public:
         const std::uint64_t numBlocksToTest = options.count.value_or(numBlocksOnDevice);
         const std::uint64_t lastBlockSize = deviceSize - (numBlocksOnDevice - 1) * options.blockSize;
 
+        const auto indexTransformer = [&iterationOrderCipher, &options, numBlocksOnDevice](std::uint64_t index) 
+        {
+            std::uint64_t transformedIndex = 0xFFFFFFFFFFFFFFFF;
+            if (options.linear) {
+                transformedIndex = index;
+            }
+            else if (!EncryptIndex(iterationOrderCipher, index, numBlocksOnDevice, transformedIndex)) {
+                throw std::runtime_error("Error: Failed to encrypt index " + std::to_string(index));
+            }
+            return transformedIndex;
+        };
+
+        auto enqueueReadOperation = [&indexTransformer, &workItemBuffer, &options, &numQueuedWorkItems, this, numBlocksOnDevice, lastBlockSize](std::uint64_t index)
+        {
+            std::uint64_t transformedIndex = indexTransformer(index);
+
+            EXPECT(!workItemBuffer.empty(), "workItemBuffer is empty, with numQueuedWorkItems = " + std::to_string(numQueuedWorkItems) +
+                                                " and readIndex = " + std::to_string(index));
+            std::unique_ptr<WorkItem> workItem;
+            workItem.swap(workItemBuffer.back());
+            workItemBuffer.pop_back();
+
+            workItem->offset = transformedIndex * options.blockSize;
+            workItem->operation = Operation::Read;
+            workItem->success = false;
+            workItem->durationInNanoseconds = 0;
+
+            bool isLastBlock = transformedIndex == numBlocksOnDevice - 1;
+            std::uint64_t size = isLastBlock ? lastBlockSize : options.blockSize;
+            workItem->data.resize(size);
+
+            {
+                std::unique_lock<std::mutex> lock(m_mutex);
+                m_workQueue.push_back(std::move(workItem));
+                m_conditionVariable.notify_one();
+                numQueuedWorkItems++;
+            }
+        };
+
+        auto dequeueFinishedWorkItem = [this, &numQueuedWorkItems]()
+        {
+            std::unique_lock<std::mutex> lock(m_mutex);
+            m_conditionVariable.wait(lock, [this]
+                                     { return !m_resultQueue.empty() || !m_workerThreadError.empty(); });
+            if (!m_workerThreadError.empty()) {
+                throw std::runtime_error(m_workerThreadError);
+            }
+
+            EXPECT(!m_resultQueue.empty(), "m_resultQueue is empty");
+            std::unique_ptr<WorkItem> workItem;
+            workItem.swap(m_resultQueue.front());
+            m_resultQueue.erase(m_resultQueue.begin());
+            numQueuedWorkItems--;
+
+            return workItem;
+        };
+
+        auto verifyBlockContent = [&dataCipher, &pattern, &zeros, &verificationBuffer](const std::unique_ptr<WorkItem>& workItem, std::uint64_t blockIndex)
+        {
+            if (!pattern.empty()) {
+                for (size_t i = 0; i < workItem->data.size(); ++i) {
+                    if (workItem->data[i] != pattern[i % pattern.size()]) {
+                        return false;
+                    }
+                }
+            }
+            else {
+                std::uint64_t iv = workItem->offset;
+                EXPECT(workItem->data.size() <= verificationBuffer.size(), "workItem->data.size() > verificationBuffer.size()");
+                bool success = dataCipher.Decrypt(workItem->data.data(), verificationBuffer.data(), workItem->data.size(), iv);
+                if (!success) {
+                    throw std::runtime_error("Error: Failed to decrypt data for block " + std::to_string(blockIndex));
+                }
+                if (std::memcmp(zeros.data(), verificationBuffer.data(), workItem->data.size()) != 0) {
+                    return false;
+                }
+            }
+            return true;
+        };
+
+        std::uint64_t writeIndex = 0;
+        std::uint64_t readIndex = 0;
+
+        if (options.resume) {
+            // Do a binary search to find the last block that was written
+            std::uint64_t low = 0;
+            std::uint64_t high = numBlocksOnDevice;
+            while (low < high) {
+                std::uint64_t mid = low + (high - low) / 2;
+                std::uint64_t transformedIndex = indexTransformer(mid);
+                enqueueReadOperation(mid);
+                std::unique_ptr<WorkItem> workItem = dequeueFinishedWorkItem();
+                if (!workItem->success) {
+                    throw std::runtime_error("Error: Failed to read block " + std::to_string(mid));
+                }
+                else if (verifyBlockContent(workItem, mid)) {
+                    low = mid + 1;
+                }
+                else {
+                    high = mid;
+                }
+                workItemBuffer.push_back(std::move(workItem));
+            }
+
+            if (low == 0) {
+                std::cout << "No blocks found on device, exiting" << std::endl;
+                return;
+            }
+            else {
+                std::cout << "Resuming from block " << low << std::endl;
+                writeIndex = low;
+                readIndex = options.overlap > 0 ? writeIndex - writeIndex * options.overlap / 100.0 : 0;
+            }
+        }
+
         std::vector<std::uint32_t> writeLatencyInMicroseconds;
         std::vector<std::uint32_t> readLatencyInMicroseconds;
         writeLatencyInMicroseconds.reserve(numBlocksToTest);
@@ -826,29 +941,21 @@ public:
         CPeriodicTimer periodicTimer(1000 * 1000 * 1000); // 1 second
         CHighResTimer totalTimer;
 
-        std::uint64_t writeIndex = 0;
-        std::uint64_t readIndex = 0;
         do {
             if (writeIndex < numBlocksToTest) {
-                std::uint64_t randomizedIndex = 0xFFFFFFFFFFFFFFFF;
-                if (options.linear) {
-                    randomizedIndex = writeIndex;
-                }
-                else if (!EncryptIndex(iterationOrderCipher, writeIndex, numBlocksOnDevice, randomizedIndex)) {
-                    throw std::runtime_error("Error: Failed to encrypt index " + std::to_string(writeIndex));
-                }
+                std::uint64_t transformedIndex = indexTransformer(writeIndex);
 
                 EXPECT(!workItemBuffer.empty(), "workItemBuffer is empty, with numQueuedWorkItems = " + std::to_string(numQueuedWorkItems));
                 std::unique_ptr<WorkItem> workItem;
                 workItem.swap(workItemBuffer.back());
                 workItemBuffer.pop_back();
 
-                workItem->offset = randomizedIndex * options.blockSize;
+                workItem->offset = transformedIndex * options.blockSize;
                 workItem->operation = Operation::Write;
                 workItem->success = false;
                 workItem->durationInNanoseconds = 0;
 
-                bool isLastBlock = randomizedIndex == numBlocksOnDevice - 1;
+                bool isLastBlock = transformedIndex == numBlocksOnDevice - 1;
                 std::uint64_t size = isLastBlock ? lastBlockSize : options.blockSize;
                 workItem->data.resize(size);
                 if (!pattern.empty()) {
@@ -860,7 +967,7 @@ public:
                     std::uint64_t iv = workItem->offset;
                     bool success = dataCipher.Encrypt(zeros.data(), workItem->data.data(), size, iv);
                     if (!success) {
-                        throw std::runtime_error("Error: Failed to encrypt data for block " + std::to_string(randomizedIndex));
+                        throw std::runtime_error("Error: Failed to encrypt data for block " + std::to_string(transformedIndex));
                     }
                 }
 
@@ -886,54 +993,13 @@ public:
             }
 
             if (read) {
-                std::uint64_t randomizedIndex = 0xFFFFFFFFFFFFFFFF;
-                if (options.linear) {
-                    randomizedIndex = readIndex;
-                }
-                else if (!EncryptIndex(iterationOrderCipher, readIndex, numBlocksOnDevice, randomizedIndex)) {
-                    throw std::runtime_error("Error: Failed to encrypt index " + std::to_string(readIndex));
-                }
-
-                EXPECT(!workItemBuffer.empty(), "workItemBuffer is empty, with numQueuedWorkItems = " + std::to_string(numQueuedWorkItems) + 
-                                                " and readIndex = " + std::to_string(readIndex));
-                std::unique_ptr<WorkItem> workItem;
-                workItem.swap(workItemBuffer.back());
-                workItemBuffer.pop_back();
-
-                workItem->offset = randomizedIndex * options.blockSize;
-                workItem->operation = Operation::Read;
-                workItem->success = false;
-                workItem->durationInNanoseconds = 0;
-
-                bool isLastBlock = randomizedIndex == numBlocksOnDevice - 1;
-                std::uint64_t size = isLastBlock ? lastBlockSize : options.blockSize;
-                workItem->data.resize(size);
-
-                {
-                    std::unique_lock<std::mutex> lock(m_mutex);
-                    m_workQueue.push_back(std::move(workItem));
-                    m_conditionVariable.notify_one();
-                    numQueuedWorkItems++;
-                }
+                enqueueReadOperation(readIndex);
 
                 readIndex++;
             }
 
             while (numQueuedWorkItems >= 2 || (numQueuedWorkItems > 0 && readIndex == numBlocksToTest)) {
-                std::unique_ptr<WorkItem> workItem;
-                {
-                    std::unique_lock<std::mutex> lock(m_mutex);
-                    m_conditionVariable.wait(lock, [this] { return !m_resultQueue.empty() || !m_workerThreadError.empty(); });
-                    if (!m_workerThreadError.empty()) {
-                        throw std::runtime_error(m_workerThreadError);
-                    }
-
-                    EXPECT(!m_resultQueue.empty(), "m_resultQueue is empty");
-                    workItem.swap(m_resultQueue.front());
-                    m_resultQueue.erase(m_resultQueue.begin());
-                    numQueuedWorkItems--;
-                }
-
+                std::unique_ptr<WorkItem> workItem = dequeueFinishedWorkItem();
                 const std::uint64_t blockIndex = workItem->offset / options.blockSize;
 
                 if (workItem->operation == Operation::Write) {
@@ -947,22 +1013,8 @@ public:
                     if (!workItem->success) {
                         readFailureOffsets.push_back(workItem->offset);
                     }
-                    else if (!pattern.empty()) {
-                        for (size_t i = 0; i < workItem->data.size(); ++i) {
-                            if (workItem->data[i] != pattern[i % pattern.size()]) {
-                                verificationFailureOffsets.push_back(workItem->offset);
-                                break;
-                            }
-                        }
-                    }
                     else {
-                        std::uint64_t iv = workItem->offset;
-                        EXPECT(workItem->data.size() <= verificationBuffer.size(), "workItem->data.size() > verificationBuffer.size()");
-                        bool success = dataCipher.Decrypt(workItem->data.data(), verificationBuffer.data(), workItem->data.size(), iv);
-                        if (!success) {
-                            throw std::runtime_error("Error: Failed to decrypt data for block " + std::to_string(blockIndex));
-                        }
-                        if (std::memcmp(zeros.data(), verificationBuffer.data(), workItem->data.size()) != 0) {
+                        if (!verifyBlockContent(workItem, blockIndex)) {
                             verificationFailureOffsets.push_back(workItem->offset);
                         }
                     }
@@ -1201,8 +1253,10 @@ able to resume a test that was interrupted (if --seed=SEED was used).
         the data).
   -r, --resume
         Scan for the last block written, and resume from there. This is useful if the program was
-        interrupted and you want to continue where it left off. This will not work when overlap is
-        used, and you must specify the same seed or pattern as before.
+        interrupted and you want to continue where it left off. You must specify the same pattern
+        or seed as you used when you started the test. It will not "remember" any bad blocks
+        detected in the previous run, so maybe you should not use overlap with this option (it is
+        ok to remove the option of overlap when resuming).
   -s, --seed=SEED
         Specify the seed to use for the random number generator. If not specified, a random seed is
         used, which makes it impossible to resume the test later, and to try the exact same test
@@ -1361,7 +1415,8 @@ Options parseCommandLine(int argc, char *argv[]) {
     }
 
     if (opts.overlap > 0 && opts.resume) {
-        throw std::invalid_argument("Error: --overlap and --resume are incompatible.");
+        std::cout << "Warning: Using --overlap with --resume means all blocks will not be read on this pass\n"
+                    << "and thus all blocks will not be verified." << std::endl;
     }
 
     if (opts.resume && !opts.seed.has_value() && !opts.pattern.has_value()) {
